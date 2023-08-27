@@ -19,23 +19,15 @@ from torch_geometric.data import DataLoader, DataListLoader, Batch
 import random
 import pandas as pd
 
-# Set the device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import sys
 
-seed = 1234
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-np.random.seed(seed)
-random.seed(seed)
-
-# Directory to search
-dir = "simple-job-board"
-
-data_ls = []
-no_flaws = 0
-parser = make_parser()
-lexer = phplex.lexer.clone()
+#data_ls = []
+#no_flaws = 0
+#parser = make_parser()
+#lexer = phplex.lexer.clone()
 ignore_tokens = ['LBRACE','RBRACE']
+
+ignore = {'WHITESPACE', 'OPEN_TAG', 'CLOSE_TAG'}
 
 def process(line, allfuncs,allvars):
     lexer = phplex.lexer.clone()
@@ -76,7 +68,7 @@ def get_tokens(data):
         except IndexError:
             break
         except SyntaxError:
-            print("syntax error :(")
+            #print("syntax error :(")
             synerror = True
             break
         if not tok:
@@ -121,10 +113,10 @@ def file_to_tree(filename):
                 return None
             parsed = parser.parse(file_content, lexer=lexer)
     except UnicodeDecodeError:
-        print("error decoding " + filename)
+        #print("error decoding " + filename)
         return None
     except SyntaxError:
-        print("error syntax " + filename)
+        #print("error syntax " + filename)
         return None
     tree = intervaltree.IntervalTree()
     allnodes = []
@@ -143,144 +135,170 @@ def file_to_tree(filename):
             tree[start:end] = node
     return tree
 
-
-
-
 def get_all_funcs(nodes):
     allfuncs = []
     for node in nodes:
         allfuncs.extend(node.stmt_funcs)
     return allfuncs
+
 vuln_dict = {1:"SQLi",2:"XSS",3:"CI"}
-model = PhpNetGraphTokensCombine()
-model.load_state_dict(torch.load("model_combine.pt",device))
-model.to(device)
-model.eval()
 
-ignore = {'WHITESPACE', 'OPEN_TAG', 'CLOSE_TAG'}
-vulns = 0
-funcs = 0
-predicted = []
+#All logic for running model on input directories is aggregated into function.
+#Accepts array of target paths, returns array of results, which are arrays of output strings as in original version.
+def run_model(targets):
+    # Set the device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Recover the model
+    model = PhpNetGraphTokensCombine()
+    #crutch
+    try:
+        model.load_state_dict(torch.load("model_combine.pt",device))
+    except:
+        model.load_state_dict(torch.load(os.path.join(sys.path[0], "model_combine.pt"),device))
+    model.to(device)
+    model.eval()
 
-for root, dirs, files in os.walk(dir):
-    for filename in files:
-        file = root + os.sep + filename
-        if ".php" in file:
-            matches = file_to_tree(file)
-            # print(matches)
-            if matches is None or len(matches) == 0:
-                matches = [None]
+    # Perform the scan
+    results = []
+    for target in targets:
+        seed = 1234
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
-            if matches:
-                for match in matches:
-                    funcs += 1
-                    with open(file, "r") as myfile:
-                        code_tokens = []
-                        lexer = phplex.lexer.clone()
-                        parser = make_parser()
-                        if match is not None:
-                            interval = min([match], key=lambda i: i[1] - i[0])
+        output = []
 
-                            func_lines = ["<?php "]
-                            startsopen = False
-                            no_braces = 0
-                            try:
-                                for i, line in enumerate(myfile):
-                                    if i >= interval[1]:
+        vulns = 0
+        funcs = 0
+        predicted = []
+
+        for root, dirs, files in os.walk(target):
+            for filename in files:
+                file = root + os.sep + filename
+                if ".php" in file:
+                    matches = file_to_tree(file)
+                    # print(matches)
+                    if matches is None or len(matches) == 0:
+                        matches = [None]
+
+                    if matches:
+                        for match in matches:
+                            funcs += 1
+                            with open(file, "r") as myfile:
+                                code_tokens = []
+                                lexer = phplex.lexer.clone()
+                                parser = make_parser()
+                                if match is not None:
+                                    interval = min([match], key=lambda i: i[1] - i[0])
+
+                                    func_lines = ["<?php "]
+                                    startsopen = False
+                                    no_braces = 0
+                                    try:
+                                        for i, line in enumerate(myfile):
+                                            if i >= interval[1]:
+                                                break
+                                            elif i >= interval[0]:
+                                                if line.strip() == "{" and i == interval[0]:
+                                                    startsopen = True
+                                                    continue
+                                                elif line.strip() == "}" and i == (interval[1] - 1) and no_braces == 0:
+                                                    continue
+
+                                                if '{' in line:
+                                                    no_braces += line.count('{')
+                                                if '}' in line:
+                                                    no_braces -= line.count('}')
+                                                func_lines.append(line)
+                                    except UnicodeDecodeError:
+                                        #output.append("unidecode error")
+                                        continue
+                                    data = ''.join(func_lines)
+                                else:
+                                    try:
+                                        data = myfile.read()
+                                    except UnicodeDecodeError:
+                                        #output.append("unidecode error")
+                                        continue
+                                try:
+                                    nodes = parser.parse(data, lexer=lexer, tracking=True, debug=False)
+                                except:
+                                    #output.append("parsing error")
+                                    #output.append("here " + file)
+                                    continue
+                                listener = MyPHPListener(name=file)
+
+                                php_traverser.traverse(nodes, listener)
+
+                                cfg = listener.get_graph()
+                                allvars = set()
+                                for node in list(cfg.nodes):
+                                    for var in node.stmt_vars:
+                                        allvars.add(var)
+
+                                allfuncs = get_all_funcs(cfg.nodes)
+                                edges = [[list(cfg.nodes).index(i), list(cfg.nodes).index(j)] for (i, j) in cfg.edges]
+
+
+                                if len(edges) == 0:
+                                    continue
+                                edges = torch.tensor(edges, dtype=torch.long)
+                                try:
+                                    graph_nodes = torch.tensor([process(node.text, allfuncs, list(allvars)) for node in list(cfg.nodes)])
+                                except Exception as e:
+                                    #output.append("Tokenising error " + file)
+                                    continue
+                                data_graph = Data(x=graph_nodes, edge_index=edges.t().contiguous())
+                                lexer = phplex.lexer.clone()
+                                lexer.input(data)
+                                synerror = False
+                                while True:
+                                    try:
+                                        tok = lexer.token()
+                                    except IndexError:
                                         break
-                                    elif i >= interval[0]:
-                                        if line.strip() == "{" and i == interval[0]:
-                                            startsopen = True
-                                            continue
-                                        elif line.strip() == "}" and i == (interval[1] - 1) and no_braces == 0:
-                                            continue
-
-                                        if '{' in line:
-                                            no_braces += line.count('{')
-                                        if '}' in line:
-                                            no_braces -= line.count('}')
-                                        func_lines.append(line)
-                            except UnicodeDecodeError:
-                                print("unidecode error")
-                                continue
-                            data = ''.join(func_lines)
-                        else:
-                            try:
-                                data = myfile.read()
-                            except UnicodeDecodeError:
-                                print("unidecode error")
-                                continue
-                        try:
-                            nodes = parser.parse(data, lexer=lexer, tracking=True, debug=False)
-                        except:
-                            print("parsing error")
-                            print("here " + file)
-                            continue
-                        listener = MyPHPListener(name=file)
-
-                        php_traverser.traverse(nodes, listener)
-
-                        cfg = listener.get_graph()
-                        allvars = set()
-                        for node in list(cfg.nodes):
-                            for var in node.stmt_vars:
-                                allvars.add(var)
-
-                        allfuncs = get_all_funcs(cfg.nodes)
-                        edges = [[list(cfg.nodes).index(i), list(cfg.nodes).index(j)] for (i, j) in cfg.edges]
+                                    except SyntaxError:
+                                        #output.append("syntax error :(")
+                                        synerror = True
+                                        break
+                                    if not tok:
+                                        break
+                                    if tok in ignore:
+                                        continue
+                                    tok = sub_tokens.sub_token(tok,allfuncs,list(allvars))
+                                    code_tokens.append(tok)
+                                data_tokens = main.get_data_custom_no_y([code_tokens])
+                                data_token_in = data_tokens.to(device=device, dtype=torch.long)
+                                data_graph_batch = Batch.from_data_list([data_graph]).to(device)
+                                pred = model(data_graph_batch,data_token_in)
+                                vals = pred.cpu().detach().numpy()
+                                preds = np.argmax(vals, axis=1)
+                                if preds > 0:
+                                    output.append("Found Vuln")
+                                    output.append(str(vuln_dict[preds[0]]))
+                                    predicted.append(str(vuln_dict[preds[0]]))
+                                    output.append("in")
+                                    output.append(str(file))
+                                    if match is not None:
+                                        output.append("function")
+                                        output.append(str(match[2]))
+                                    #print("code body is")
+                                    #print(data)
+                                    output.append("NEXT")
+                                    vulns+=1
+                                else:
+                                    predicted.append('Safe')
 
 
-                        if len(edges) == 0:
-                            continue
-                        edges = torch.tensor(edges, dtype=torch.long)
-                        try:
-                            graph_nodes = torch.tensor([process(node.text, allfuncs, list(allvars)) for node in list(cfg.nodes)])
-                        except Exception as e:
-                            print("Tokenising error " + file)
-                            continue
-                        data_graph = Data(x=graph_nodes, edge_index=edges.t().contiguous())
-                        lexer = phplex.lexer.clone()
-                        lexer.input(data)
-                        synerror = False
-                        while True:
-                            try:
-                                tok = lexer.token()
-                            except IndexError:
-                                break
-                            except SyntaxError:
-                                print("syntax error :(")
-                                synerror = True
-                                break
-                            if not tok:
-                                break
-                            if tok in ignore:
-                                continue
-                            tok = sub_tokens.sub_token(tok,allfuncs,list(allvars))
-                            code_tokens.append(tok)
-                        data_tokens = main.get_data_custom_no_y([code_tokens])
-                        data_token_in = data_tokens.to(device=device, dtype=torch.long)
-                        data_graph_batch = Batch.from_data_list([data_graph]).to(device)
-                        pred = model(data_graph_batch,data_token_in)
-                        vals = pred.cpu().detach().numpy()
-                        preds = np.argmax(vals, axis=1)
-                        if preds > 0:
-                            print("Found Vuln")
-                            print(vuln_dict[preds[0]])
-                            predicted.append(vuln_dict[preds[0]])
-                            print("in")
-                            print(file)
-                            if match is not None:
-                                print("function")
-                                print(match[2])
-                            print("code body is")
-                            print(data)
-                            print("NEXT")
-                            vulns+=1
-                        else:
-                            predicted.append('Safe')
+        output.append('')
+        output.append('Total predicted as vulnerable: ' + str(vulns))
+        output.append('Total functions: ' + str(funcs))
+        output.append('')
+        output.append('Predicted distribution:')
+        output.append(str(pd.value_counts(predicted)))
 
+        results.append(output)    
 
-print('\nTotal predicted as vulnerable: ',vulns)
-print('Total functions: ',funcs)
-print('\nPredicted distribution:')
-print(pd.value_counts(predicted))
+    return results

@@ -1,0 +1,4 @@
+*.pt
+data
+data-scrapers
+__pycache__

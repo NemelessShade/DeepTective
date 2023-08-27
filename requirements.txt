@@ -34,10 +34,3 @@ scipy==1.5.2
 six==1.15.0
 sortedcontainers==2.2.2
 threadpoolctl==2.1.0
-torch==1.5.1
-torch-geometric==1.6.0
-torch-scatter==2.0.5
-torch-sparse==0.6.6
-tqdm==4.48.0
-urllib3==1.25.10
-wandb
