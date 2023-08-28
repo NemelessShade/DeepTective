@@ -302,3 +302,15 @@ def run_model(targets):
         results.append(output)    
 
     return results
+
+if __name__ == '__main__':
+    targets = [path for path in sys.argv[1:] if os.path.isdir(path)]
+    if targets:
+        results = run_model(targets)
+        for target, res in zip(targets, results):
+            print("Target", target)
+            for line in res:
+                print(line)
+            print()
+    else:
+        print("No valid targets provided")
